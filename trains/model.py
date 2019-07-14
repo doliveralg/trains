@@ -16,7 +16,7 @@ from .debugging.log import get_logger
 from .storage import StorageHelper
 from .utilities.enum import Options
 from .backend_interface import Task as _Task
-from .backend_interface.model import Model as _Model, DummyModel as _DummyModel
+from .backend_interface.model import create_dummy_model, Model as _Model
 from .config import running_remotely, get_cache_dir
 
 ARCHIVED_TAG = "archived"
@@ -643,7 +643,7 @@ class OutputModel(BaseModel):
 
         self._model_local_filename = None
         self._base_model = None
-        self._floating_data = _DummyModel(
+        self._floating_data = create_dummy_model(
             design=_Model._wrap_design(config_text),
             labels=label_enumeration or task.get_labels_enumeration(),
             name=name,
@@ -810,7 +810,7 @@ class OutputModel(BaseModel):
                 framework=self.framework or framework,
                 comment=comment,
                 cb=delete_previous_weights_file if auto_delete_file else None,
-                iteration=iteration or self._task.data.last_iteration,
+                iteration=iteration or self._task.get_last_iteration(),
             )
         elif register_uri:
             register_uri = StorageHelper.conform_url(register_uri)

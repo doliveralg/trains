@@ -12,7 +12,7 @@ from .backend_interface.task.development.worker import DevWorker
 from .backend_interface.task.log import TaskHandler
 from .storage import StorageHelper
 from .utilities.plotly_reporter import SeriesInfo
-from .backend_interface import TaskStatusEnum
+from .backend_api.services import tasks
 from .backend_interface.task import Task as _Task
 from .config import running_remotely, get_cache_dir
 
@@ -75,7 +75,7 @@ class Logger(object):
         self._report_worker = None
         self._task_handler = None
 
-        if DevWorker.report_stdout and not PrintPatchLogger.patched:
+        if DevWorker.report_stdout and not PrintPatchLogger.patched and not running_remotely():
             Logger._stdout_proxy = PrintPatchLogger(sys.stdout, self, level=logging.INFO)
             Logger._stderr_proxy = PrintPatchLogger(sys.stderr, self, level=logging.ERROR)
             self._task_handler = TaskHandler(self._task.session, self._task.id, capacity=100)
@@ -91,6 +91,12 @@ class Logger(object):
                 pass
             sys.stdout = Logger._stdout_proxy
             sys.stderr = Logger._stderr_proxy
+        elif DevWorker.report_stdout and not running_remotely():
+            self._task_handler = TaskHandler(self._task.session, self._task.id, capacity=100)
+            if Logger._stdout_proxy:
+                Logger._stdout_proxy.connect(self)
+            if Logger._stderr_proxy:
+                Logger._stderr_proxy.connect(self)
 
     def console(self, msg, level=logging.INFO, omit_console=False, *args, **kwargs):
         """
@@ -193,7 +199,29 @@ class Logger(object):
         :type values: [float]
         :param iteration: Iteration number
         :type iteration: int
-        :param labels: optional label per entry in the vector (for histogram)
+        :param labels: optional, labels for each bar group.
+        :type labels: list of strings.
+        :param xlabels: optional label per entry in the vector (bucket in the histogram)
+        :type xlabels: list of strings.
+        """
+        return self.report_histogram(title, series, values, iteration, labels=labels, xlabels=xlabels)
+
+    def report_histogram(self, title, series, values, iteration, labels=None, xlabels=None):
+        """
+        Report a histogram plot
+
+        :param title: Title (AKA metric)
+        :type title: str
+        :param series: Series (AKA variant)
+        :type series: str
+        :param values: Reported values (or numpy array)
+        :type values: [float]
+        :param iteration: Iteration number
+        :type iteration: int
+        :param labels: optional, labels for each bar group.
+        :type labels: list of strings.
+        :param xlabels: optional label per entry in the vector (bucket in the histogram)
+        :type xlabels: list of strings.
         """
 
         if not isinstance(values, np.ndarray):
@@ -505,6 +533,49 @@ class Logger(object):
             max_image_history=max_image_history,
         )
 
+    def report_image_plot_and_upload(self, title, series, iteration, path=None, matrix=None, max_image_history=None):
+        """
+        Report an image, upload its contents, and present in plots section using plotly
+
+        Image is uploaded to a preconfigured bucket (see setup_upload()) with a key (filename)
+        describing the task ID, title, series and iteration.
+
+        :param title: Title (AKA metric)
+        :type title: str
+        :param series: Series (AKA variant)
+        :type series: str
+        :param iteration: Iteration number
+        :type iteration: int
+        :param path: A path to an image file. Required unless matrix is provided.
+        :type path: str
+        :param matrix: A 3D numpy.ndarray object containing image data (RGB). Required unless filename is provided.
+        :type matrix: str
+        :param max_image_history: maximum number of image to store per metric/variant combination \
+        use negative value for unlimited. default is set in global configuration (default=5)
+        :type max_image_history: int
+        """
+
+        # if task was not started, we have to start it
+        self._start_task_if_needed()
+        upload_uri = self._default_upload_destination or self._task._get_default_report_storage_uri()
+        if not upload_uri:
+            upload_uri = Path(get_cache_dir()) / 'debug_images'
+            upload_uri.mkdir(parents=True, exist_ok=True)
+            # Verify that we can upload to this destination
+            upload_uri = str(upload_uri)
+            storage = StorageHelper.get(upload_uri)
+            upload_uri = storage.verify_upload(folder_uri=upload_uri)
+
+        self._task.reporter.report_image_plot_and_upload(
+            title=title,
+            series=series,
+            path=path,
+            matrix=matrix,
+            iter=iteration,
+            upload_uri=upload_uri,
+            max_image_history=max_image_history,
+        )
+
     def set_default_upload_destination(self, uri):
         """
         Set the uri to upload all the debug images to.
@@ -577,7 +648,7 @@ class Logger(object):
                 pass
 
     def _start_task_if_needed(self):
-        if self._task._status == TaskStatusEnum.created:
+        if self._task._status == tasks.TaskStatusEnum.created:
             self._task.mark_started()
 
         self._task._dev_mode_task_start()

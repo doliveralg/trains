@@ -6,9 +6,8 @@ import os
 import sys
 import warnings
 from fnmatch import fnmatch
-from logging import Logger
 from os.path import expanduser
-from typing import Any, Text
+from typing import Any
 
 import pyhocon
 import six
@@ -21,7 +20,6 @@ from pyparsing import (
     ParseSyntaxException,
 )
 from six.moves.urllib.parse import urlparse
-from watchdog.observers import Observer
 
 from .bucket_config import S3BucketConfig
 from .defs import (
@@ -37,8 +35,14 @@ from .defs import is_config_file
 from .entry import Entry, NotSet
 from .errors import ConfigurationError
 from .log import initialize as initialize_log, logger
-from .reloader import ConfigReloader
 from .utils import get_options
+
+try:
+    from typing import Text
+except ImportError:
+    # windows conda-less hack
+    Text = Any
+
 
 log = logger(__file__)
 
@@ -77,7 +81,6 @@ class Config(object):
         verbose=True,
         relative_to=None,
         app=None,
-        watch=False,
         is_server=False,
         **_
     ):
@@ -88,12 +91,7 @@ class Config(object):
         self._config = ConfigTree()
         self._env = env or os.environ.get("TRAINS_ENV", Environment.default)
         self.config_paths = set()
-        self.watch = watch
         self.is_server = is_server
-        if watch:
-            self.observer = Observer()
-            self.observer.start()
-            self.handler = ConfigReloader(self)
 
         if self._verbose:
             print("Config env:%s" % str(self._env))
@@ -132,9 +130,6 @@ class Config(object):
 
         self.roots = list(map(normalize, module_paths))
         self.reload()
-        if self.watch:
-            for path in self.config_paths:
-                self.observer.schedule(self.handler, str(path), recursive=True)
 
     def _reload(self):
         env = self._env
@@ -150,24 +145,26 @@ class Config(object):
             env_config_paths = [expanduser(env_config_path_override)]
 
         # merge configuration from root and other environment config paths
-        config = functools.reduce(
-            lambda cfg, path: ConfigTree.merge_configs(
-                cfg,
-                self._read_recursive_for_env(path, env, verbose=self._verbose),
-                copy_trees=True,
-            ),
-            self.roots + env_config_paths,
-            config,
-        )
+        if self.roots or env_config_paths:
+            config = functools.reduce(
+                lambda cfg, path: ConfigTree.merge_configs(
+                    cfg,
+                    self._read_recursive_for_env(path, env, verbose=self._verbose),
+                    copy_trees=True,
+                ),
+                self.roots + env_config_paths,
+                config,
+            )
 
         # merge configuration from local configuration paths
-        config = functools.reduce(
-            lambda cfg, path: ConfigTree.merge_configs(
-                cfg, self._read_recursive(path, verbose=self._verbose), copy_trees=True
-            ),
-            LOCAL_CONFIG_PATHS,
-            config,
-        )
+        if LOCAL_CONFIG_PATHS:
+            config = functools.reduce(
+                lambda cfg, path: ConfigTree.merge_configs(
+                    cfg, self._read_recursive(path, verbose=self._verbose), copy_trees=True
+                ),
+                LOCAL_CONFIG_PATHS,
+                config,
+            )
 
         local_config_files = LOCAL_CONFIG_FILES
         local_config_override = os.environ.get(LOCAL_CONFIG_FILE_OVERRIDE_VAR)
@@ -175,15 +172,16 @@ class Config(object):
             local_config_files = [expanduser(local_config_override)]
 
         # merge configuration from local configuration files
-        config = functools.reduce(
-            lambda cfg, file_path: ConfigTree.merge_configs(
-                cfg,
-                self._read_single_file(file_path, verbose=self._verbose),
-                copy_trees=True,
-            ),
-            local_config_files,
-            config,
-        )
+        if local_config_files:
+            config = functools.reduce(
+                lambda cfg, file_path: ConfigTree.merge_configs(
+                    cfg,
+                    self._read_single_file(file_path, verbose=self._verbose),
+                    copy_trees=True,
+                ),
+                local_config_files,
+                config,
+            )
 
         config["env"] = env
         return config
@@ -256,10 +254,13 @@ class Config(object):
             default_config = self._read_recursive(
                 root_path / Environment.default, verbose=verbose
             )
-            env_config = self._read_recursive(
-                root_path / env, verbose=verbose
-            )  # None is ok, will return empty config
-            config = ConfigTree.merge_configs(default_config, env_config, True)
+            if (root_path / env) != (root_path / Environment.default):
+                env_config = self._read_recursive(
+                    root_path / env, verbose=verbose
+                )  # None is ok, will return empty config
+                config = ConfigTree.merge_configs(default_config, env_config, True)
+            else:
+                config = default_config
         else:
             config = ConfigTree()
 
@@ -275,9 +276,6 @@ class Config(object):
             if verbose:
                 print("No config in %s" % str(conf_root))
             return conf
-
-        if self.watch:
-            self.config_paths.add(conf_root)
 
         if verbose:
             print("Loading config from %s" % str(conf_root))

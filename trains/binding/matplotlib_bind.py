@@ -1,7 +1,7 @@
+import os
 import sys
+from tempfile import mkstemp
 
-import cv2
-import numpy as np
 import six
 from six import BytesIO
 
@@ -12,6 +12,8 @@ from ..config import running_remotely
 class PatchedMatplotlib:
     _patched_original_plot = None
     __patched_original_imshow = None
+    __patched_original_draw_all = None
+    __patched_draw_all_recursion_guard = False
     _global_plot_counter = -1
     _global_image_counter = -1
     _current_task = None
@@ -45,18 +47,18 @@ class PatchedMatplotlib:
 
             if running_remotely():
                 # disable GUI backend - make headless
-                sys.modules['matplotlib'].rcParams['backend'] = 'agg'
+                matplotlib.rcParams['backend'] = 'agg'
                 import matplotlib.pyplot
-                sys.modules['matplotlib'].pyplot.switch_backend('agg')
+                matplotlib.pyplot.switch_backend('agg')
             import matplotlib.pyplot as plt
             from matplotlib import _pylab_helpers
             if six.PY2:
-                PatchedMatplotlib._patched_original_plot = staticmethod(sys.modules['matplotlib'].pyplot.show)
-                PatchedMatplotlib._patched_original_imshow = staticmethod(sys.modules['matplotlib'].pyplot.imshow)
+                PatchedMatplotlib._patched_original_plot = staticmethod(plt.show)
+                PatchedMatplotlib._patched_original_imshow = staticmethod(plt.imshow)
             else:
-                PatchedMatplotlib._patched_original_plot = sys.modules['matplotlib'].pyplot.show
-                PatchedMatplotlib._patched_original_imshow = sys.modules['matplotlib'].pyplot.imshow
-            sys.modules['matplotlib'].pyplot.show = PatchedMatplotlib.patched_show
+                PatchedMatplotlib._patched_original_plot = plt.show
+                PatchedMatplotlib._patched_original_imshow = plt.imshow
+            plt.show = PatchedMatplotlib.patched_show
             # sys.modules['matplotlib'].pyplot.imshow = PatchedMatplotlib.patched_imshow
             # patch plotly so we know it failed us.
             from plotly.matplotlylib import renderer
@@ -71,7 +73,11 @@ class PatchedMatplotlib:
                 from IPython import get_ipython
                 ip = get_ipython()
                 if ip and matplotlib.is_interactive():
-                    ip.events.register('post_execute', PatchedMatplotlib.ipython_post_execute_hook)
+                    # instead of hooking ipython, we should hook the matplotlib
+                    import matplotlib.pyplot as plt
+                    PatchedMatplotlib.__patched_original_draw_all = plt.draw_all
+                    plt.draw_all = PatchedMatplotlib.__patched_draw_all
+                    # ip.events.register('post_execute', PatchedMatplotlib.ipython_post_execute_hook)
         except Exception:
             pass
 
@@ -123,6 +129,7 @@ class PatchedMatplotlib:
             # convert to plotly
             image = None
             plotly_fig = None
+            image_format = 'svg'
             if not force_save_as_image:
                 # noinspection PyBroadException
                 try:
@@ -134,17 +141,28 @@ class PatchedMatplotlib:
                             return renderer.plotly_fig
 
                     plotly_fig = our_mpl_to_plotly(mpl_fig)
-                except Exception:
-                    pass
+                except Exception as ex:
+                    # this was an image, change format to jpeg
+                    if 'selfie' in str(ex):
+                        image_format = 'jpeg'
 
             # plotly could not serialize the plot, we should convert to image
             if not plotly_fig:
                 plotly_fig = None
-                buffer_ = BytesIO()
-                plt.savefig(buffer_, format="png", bbox_inches='tight', pad_inches=0)
-                buffer_.seek(0)
-                buffer = buffer_.getbuffer() if not six.PY2 else buffer_.getvalue()
-                image = cv2.imdecode(np.frombuffer(buffer, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+                # noinspection PyBroadException
+                try:
+                    # first try SVG if we fail then fallback to png
+                    buffer_ = BytesIO()
+                    plt.savefig(buffer_, format=image_format, bbox_inches='tight', pad_inches=0)
+                    buffer_.seek(0)
+                except Exception:
+                    image_format = 'png'
+                    buffer_ = BytesIO()
+                    plt.savefig(buffer_, format=image_format, bbox_inches='tight', pad_inches=0)
+                    buffer_.seek(0)
+                fd, image = mkstemp(suffix='.'+image_format)
+                os.write(fd, buffer_.read())
+                os.close(fd)
 
             # check if we need to restore the active object
             if set_active and not _pylab_helpers.Gcf.get_active():
@@ -168,14 +186,25 @@ class PatchedMatplotlib:
                     plotly_fig.layout.height = None
                     plotly_fig.layout.width = None
                     # send the plot event
-                    reporter.report_plot(title=title, series='plot', plot=plotly_fig.to_plotly_json(),
+                    plotly_dict = plotly_fig.to_plotly_json()
+                    if not plotly_dict.get('layout'):
+                        plotly_dict['layout'] = {}
+                    plotly_dict['layout']['title'] = title
+                    reporter.report_plot(title=title, series='plot', plot=plotly_dict,
                                          iter=PatchedMatplotlib._global_plot_counter if plot_title else 0)
                 else:
                     # send the plot as image
                     PatchedMatplotlib._global_image_counter += 1
                     logger = PatchedMatplotlib._current_task.get_logger()
                     title = plot_title or 'untitled %d' % PatchedMatplotlib._global_image_counter
-                    logger.report_image_and_upload(title=title, series='plot image', matrix=image,
+                    # this is actually a failed plot, we should put it under plots:
+                    # currently disabled
+                    # if image_format == 'svg':
+                    #     logger.report_image_plot_and_upload(title=title, series='plot image', path=image,
+                    #                                         iteration=PatchedMatplotlib._global_image_counter
+                    #                                         if plot_title else 0)
+                    # else:
+                    logger.report_image_and_upload(title=title, series='plot image', path=image,
                                                    iteration=PatchedMatplotlib._global_image_counter
                                                    if plot_title else 0)
         except Exception:
@@ -183,6 +212,19 @@ class PatchedMatplotlib:
             pass
 
         return
+
+    @staticmethod
+    def __patched_draw_all(*args, **kwargs):
+        recursion_guard = PatchedMatplotlib.__patched_draw_all_recursion_guard
+        if not recursion_guard:
+            PatchedMatplotlib.__patched_draw_all_recursion_guard = True
+
+        ret = PatchedMatplotlib.__patched_original_draw_all(*args, **kwargs)
+
+        if not recursion_guard:
+            PatchedMatplotlib.ipython_post_execute_hook()
+            PatchedMatplotlib.__patched_draw_all_recursion_guard = False
+        return ret
 
     @staticmethod
     def ipython_post_execute_hook():

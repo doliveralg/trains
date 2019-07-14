@@ -2,6 +2,8 @@
 import collections
 import itertools
 import logging
+from enum import Enum
+from threading import RLock, Thread
 from copy import copy
 from six.moves.urllib.parse import urlparse, urlunparse
 
@@ -20,7 +22,7 @@ from ..setupuploadmixin import SetupUploadMixin
 from ..util import make_message, get_or_create_project, get_single_result, \
     exact_match_regex
 from ...config import get_config_for_bucket, get_remote_task_id, TASK_ID_ENV_VAR, get_log_to_backend, \
-    running_remotely, get_cache_dir, config_obj
+    running_remotely, get_cache_dir
 from ...debugging import get_logger
 from ...debugging.log import LoggerRoot
 from ...storage import StorageHelper
@@ -30,12 +32,6 @@ from .log import TaskHandler
 from .repo import ScriptInfo
 from ...config import config
 
-TaskStatusEnum = tasks.TaskStatusEnum
-
-
-class TaskEntry(tasks.CreateRequest):
-    pass
-
 
 class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     """ Task manager providing task object access and management. Includes read/write access to task-associated
@@ -43,9 +39,16 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     """
 
     _anonymous_dataview_id = '__anonymous__'
+    _development_tag = 'development'
+
+    class TaskTypes(Enum):
+        def __str__(self):
+            return str(self.value)
+        training = 'training'
+        testing = 'testing'
 
     def __init__(self, session=None, task_id=None, log=None, project_name=None,
-                 task_name=None, task_type=tasks.TaskTypeEnum.training, log_to_backend=True,
+                 task_name=None, task_type=TaskTypes.training, log_to_backend=True,
                  raise_on_validation_errors=True, force_create=False):
         """
         Create a new task instance.
@@ -63,7 +66,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :type project_name: str
         :param task_name: Optional task name, used only if a new task is created.
         :type project_name: str
-        :param task_type: Optional task type, used only if a new task is created. Default is custom task.
+        :param task_type: Optional task type, used only if a new task is created. Default is training task.
         :type project_name: str (see tasks.TaskTypeEnum)
         :param log_to_backend: If True, all calls to the task's log will be logged to the backend using the API.
             This value can be overridden using the environment variable TRAINS_LOG_TASK_TO_BACKEND.
@@ -72,6 +75,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :type force_create: bool
         """
         task_id = self._resolve_task_id(task_id, log=log) if not force_create else None
+        self._edit_lock = RLock()
         super(Task, self).__init__(id=task_id, session=session, log=log)
         self._storage_uri = None
         self._input_model = None
@@ -172,6 +176,25 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return task_id
 
     def _update_repository(self):
+        def check_package_update():
+            # check latest version
+            from ...utilities.check_updates import CheckPackageUpdates
+            latest_version = CheckPackageUpdates.check_new_package_available(only_once=True)
+            if latest_version:
+                if not latest_version[1]:
+                    self.get_logger().console(
+                        'TRAINS new package available: UPGRADE to v{} is recommended!'.format(
+                            latest_version[0]),
+                    )
+                else:
+                    self.get_logger().console(
+                        'TRAINS-SERVER new version available: upgrade to v{} is recommended!'.format(
+                            latest_version[0]),
+                    )
+
+        check_package_update_thread = Thread(target=check_package_update)
+        check_package_update_thread.daemon = True
+        check_package_update_thread.start()
         result = ScriptInfo.get(log=self.log)
         for msg in result.warning_messages:
             self.get_logger().console(msg)
@@ -180,19 +203,22 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         # Since we might run asynchronously, don't use self.data (lest someone else
         # overwrite it before we have a chance to call edit)
         self._edit(script=result.script)
+        self.reload()
+        self._update_requirements(result.script.get('requirements') if result.script.get('requirements') else '')
+        check_package_update_thread.join()
 
-    def _auto_generate(self, project_name=None, task_name=None, task_type=tasks.TaskTypeEnum.training):
+    def _auto_generate(self, project_name=None, task_name=None, task_type=TaskTypes.training):
         created_msg = make_message('Auto-generated at %(time)s by %(user)s@%(host)s')
 
         project_id = None
         if project_name:
             project_id = get_or_create_project(self, project_name, created_msg)
 
-        tags = ['development'] if not running_remotely() else []
+        tags = [self._development_tag] if not running_remotely() else []
 
         req = tasks.CreateRequest(
             name=task_name or make_message('Anonymous task (%(user)s@%(host)s %(time)s)'),
-            type=task_type,
+            type=tasks.TaskTypeEnum(task_type.value),
             comment=created_msg,
             project=project_id,
             input={'view': {}},
@@ -335,8 +361,9 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
 
     def _reload(self):
         """ Reload the task object from the backend """
-        res = self.send(tasks.GetByIdRequest(task=self.id))
-        return res.response.task
+        with self._edit_lock:
+            res = self.send(tasks.GetByIdRequest(task=self.id))
+            return res.response.task
 
     def reset(self, set_started_on_success=True):
         """ Reset the task. Task will be reloaded following a successful reset. """
@@ -352,6 +379,12 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def stopped(self, ignore_errors=True):
         """ Signal that this task has stopped """
         return self.send(tasks.StoppedRequest(self.id), ignore_errors=ignore_errors)
+
+    def completed(self, ignore_errors=True):
+        """ Signal that this task has been completed """
+        if hasattr(tasks, 'CompletedRequest'):
+            return self.send(tasks.CompletedRequest(self.id, status_reason='completed'), ignore_errors=ignore_errors)
+        return self.send(tasks.StoppedRequest(self.id, status_reason='completed'), ignore_errors=ignore_errors)
 
     def mark_failed(self, ignore_errors=True, status_reason=None, status_message=None):
         """ Signal that this task has stopped """
@@ -428,7 +461,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return uri
 
     def _conditionally_start_task(self):
-        if self.status == TaskStatusEnum.created:
+        if self.status == tasks.TaskStatusEnum.created:
             self.started()
 
     @property
@@ -638,31 +671,54 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         app_host = self._get_app_server()
         parsed = urlparse(app_host)
         if parsed.port:
-            parsed = parsed._replace(netloc=parsed.netloc.replace(':%d' % parsed.port, ':8081'))
+            parsed = parsed._replace(netloc=parsed.netloc.replace(':%d' % parsed.port, ':8081', 1))
         elif parsed.netloc.startswith('demoapp.'):
-            parsed = parsed._replace(netloc=parsed.netloc.replace('demoapp.', 'demofiles.'))
+            parsed = parsed._replace(netloc=parsed.netloc.replace('demoapp.', 'demofiles.', 1))
+        elif parsed.netloc.startswith('app.'):
+            parsed = parsed._replace(netloc=parsed.netloc.replace('app.', 'files.', 1))
         else:
             parsed = parsed._replace(netloc=parsed.netloc+':8081')
         return urlunparse(parsed)
 
-    def _get_app_server(self):
-        host = config_obj.get('api.host')
+    @classmethod
+    def _get_api_server(cls):
+        return Session.get_api_server_host()
+
+    @classmethod
+    def _get_app_server(cls):
+        host = cls._get_api_server()
         if '://demoapi.' in host:
-            return host.replace('://demoapi.', '://demoapp.')
+            return host.replace('://demoapi.', '://demoapp.', 1)
         if '://api.' in host:
-            return host.replace('://api.', '://app.')
+            return host.replace('://api.', '://app.', 1)
 
         parsed = urlparse(host)
         if parsed.port == 8008:
-            return host.replace(':8008', ':8080')
+            return host.replace(':8008', ':8080', 1)
 
     def _edit(self, **kwargs):
-        # Since we ae using forced update, make sure he task status is valid
-        if not self._data or (self.data.status not in (TaskStatusEnum.created, TaskStatusEnum.in_progress)):
-            raise ValueError('Task object can only be updated if created or in_progress')
+        with self._edit_lock:
+            # Since we ae using forced update, make sure he task status is valid
+            if not self._data or (self.data.status not in (tasks.TaskStatusEnum.created,
+                                                           tasks.TaskStatusEnum.in_progress)):
+                raise ValueError('Task object can only be updated if created or in_progress')
 
-        res = self.send(tasks.EditRequest(task=self.id, force=True, **kwargs), raise_on_errors=False)
-        return res
+            res = self.send(tasks.EditRequest(task=self.id, force=True, **kwargs), raise_on_errors=False)
+            return res
+
+    def _update_requirements(self, requirements):
+        if not isinstance(requirements, dict):
+            requirements = {'pip': requirements}
+        # protection, Old API might not support it
+        try:
+            self.data.script.requirements = requirements
+            self.send(tasks.SetRequirementsRequest(task=self.id, requirements=requirements))
+        except Exception:
+            pass
+
+    def _update_script(self, script):
+        self.data.script = script
+        self._edit(script=script)
 
     @classmethod
     def create_new_task(cls, session, task_entry, log=None):
@@ -671,15 +727,15 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param session: Session object used for sending requests to the API
         :type session: Session
         :param task_entry: A task entry instance
-        :type task_entry: TaskEntry
+        :type task_entry: tasks.CreateRequest
         :param log: Optional log
         :type log: logging.Logger
         :return: A new Task instance
         """
         if isinstance(task_entry, dict):
-            task_entry = TaskEntry(**task_entry)
+            task_entry = tasks.CreateRequest(**task_entry)
 
-        assert isinstance(task_entry, TaskEntry)
+        assert isinstance(task_entry, tasks.CreateRequest)
         res = cls._send(session=session, req=task_entry, log=log)
         return cls(session, task_id=res.response.id)
 
